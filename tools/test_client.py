@@ -1,33 +1,37 @@
 #!/usr/bin/env python3
 """
-ESP-12F WiFi 桥接测试客户端
+ESP-12F WiFi 桥接测试服务端
 =============================
 
-模拟前端服务器，通过 TCP 向 ESP-12F 发送 JSON 命令，用于验证：
-  - ESP-12F 是否正确接收 TCP 数据
-  - ESP-12F 是否正确封装协议帧发往 MCU
-  - 协议帧格式是否正确（用 USB-TTL 监听 ESP-12F TX 引脚 GPIO1 可观察）
+在电脑上启动 TCP 服务端，等待 ESP-12F 连接上来，然后：
+  - 实时显示 ESP-12F 发来的数据（面板状态 / 命令确认 / 心跳等）
+  - 可交互输入 JSON 命令发送给 ESP-12F，ESP-12F 会封装协议帧发给 MCU
+
+通信角色:
+  电脑(本脚本) ←→ TCP服务端 ← WiFi → ESP-12F(TCP客户端) ← UART → MCU
+
+  本脚本是 TCP SERVER（监听），ESP-12F 是 TCP CLIENT（连接）。
 
 用法:
-  py tools/test_client.py                        # 交互模式
-  py tools/test_client.py --host 192.168.1.100   # 指定 ESP-12F IP
-  py tools/test_client.py --port 8888            # 指定端口
-  py tools/test_client.py --panel 1 1            # 直接发送面板除尘命令
-  py tools/test_client.py --selftest             # 直接发送自检命令
-  py tools/test_client.py --shutdown             # 直接发送关停命令
+  pip install pyserial           # 如果还没装
+  py tools/test_client.py        # 启动服务端，等待 ESP-12F 连接
+  py tools/test_client.py --port 8888         # 指定监听端口
+  py tools/test_client.py --panel 1 1         # 等连接后自动发送面板1除尘
+  py tools/test_client.py --selftest          # 等连接后自动发送自检命令
 
-硬件监听方法:
-  用 USB-TTL 模块连接 ESP-12F 的 GPIO1 (TXD) 和 GND，
-  打开串口助手 (115200 8N1)，即可看到 ESP-12F 发给 MCU 的协议帧。
+对应 ESP-12F 的 config.h 配置:
+  #define SERVER_IP   "电脑的IP"    // 本机 IP
+  #define SERVER_PORT 8888          // 与本脚本 --port 一致
 """
 
 import socket
 import sys
 import argparse
-import time
+import select
+import threading
 
 # ============ 默认配置 ============
-DEFAULT_HOST = "192.168.1.100"
+DEFAULT_BIND = "0.0.0.0"  # 监听所有网卡
 DEFAULT_PORT = 8888
 
 # ============ 预设命令 ============
@@ -54,18 +58,6 @@ PRESETS = {
 FRAME_SYNC = 0xAA
 FRAME_MAX_PAYLOAD = 512
 
-# 消息类型
-TYPE_SET_PANEL    = 0x20
-TYPE_SELFTEST     = 0x21
-TYPE_TASK_SWITCH  = 0x22
-TYPE_CMD_INDEX    = 0x23
-TYPE_SHUTDOWN     = 0x24
-
-TYPE_PANEL_STATUS = 0x11
-TYPE_FAULT        = 0x12
-TYPE_SELFTEST_R   = 0x13
-TYPE_ACK          = 0x14
-
 TYPE_NAMES = {
     0x11: "PANEL_STATUS",
     0x12: "FAULT",
@@ -84,7 +76,7 @@ def pack_frame(frame_type: int, payload: str) -> bytes:
     data = payload.encode("utf-8")
     length = len(data)
     if length > FRAME_MAX_PAYLOAD:
-        raise ValueError(f"payload 过长: {length} > {FRAME_MAX_PAYLOAD}")
+        raise ValueError(f"payload too long: {length} > {FRAME_MAX_PAYLOAD}")
 
     checksum = frame_type
     checksum ^= (length >> 8) & 0xFF
@@ -102,393 +94,409 @@ def pack_frame(frame_type: int, payload: str) -> bytes:
     return bytes(frame)
 
 
-def unpack_frame(byte_iter) -> dict:
-    """从字节流解析一个协议帧 (模拟 MCU wifi_driver.c 的接收逻辑)"""
-    state = 0  # 0=WAIT_SYNC, 1=WAIT_TYPE, 2=WAIT_LEN_HI, 3=WAIT_LO, 4=PAYLOAD, 5=CHECKSUM
-    frame_type = 0
-    length = 0
-    payload = bytearray()
-    checksum_calc = 0
-    payload_idx = 0
-
-    for b in byte_iter:
-        if state == 0:
-            if b == FRAME_SYNC:
-                state = 1
-                checksum_calc = 0
-                payload_idx = 0
-        elif state == 1:
-            frame_type = b
-            checksum_calc ^= b
-            state = 2
-        elif state == 2:
-            length = b << 8
-            checksum_calc ^= b
-            state = 3
-        elif state == 3:
-            length |= b
-            checksum_calc ^= b
-            if length > FRAME_MAX_PAYLOAD:
-                state = 0
-            elif length == 0:
-                state = 5
-            else:
-                state = 4
-        elif state == 4:
-            payload.append(b)
-            checksum_calc ^= b
-            payload_idx += 1
-            if payload_idx >= length:
-                state = 5
-        elif state == 5:
-            if b == checksum_calc:
-                return {
-                    "valid": True,
-                    "type": frame_type,
-                    "type_name": TYPE_NAMES.get(frame_type, "UNKNOWN"),
-                    "len": length,
-                    "payload": bytes(payload),
-                    "json": bytes(payload).decode("utf-8", errors="replace"),
-                }
-            else:
-                return {
-                    "valid": False,
-                    "calc": checksum_calc,
-                    "recv": b,
-                }
-            # state = 0  # 继续解析下一帧
-    return None
-
-
-def format_frame_hex(frame: bytes) -> str:
-    """格式化帧为十六进制字符串"""
-    parts = []
-    for b in frame:
-        parts.append(f"{b:02X}")
-    return " ".join(parts)
-
-
-def send_tcp(host: str, port: int, json_str: str, timeout: float = 5.0):
-    """通过 TCP 发送 JSON 到 ESP-12F，并接收回复"""
-    print(f"\n  连接 {host}:{port} ...")
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(timeout)
-
-    try:
-        sock.connect((host, port))
-        print(f"  已连接")
-
-        # 发送 JSON + 换行分隔符
-        data = (json_str + "\n").encode("utf-8")
-        sock.sendall(data)
-        print(f"  -> 已发送 ({len(data)-1} 字节): {json_str}")
-
-        # 同时展示封装的协议帧
-        frame_type = detect_type(json_str)
-        if frame_type:
-            frame = pack_frame(frame_type, json_str)
-            print(f"  -> 对应协议帧 ({len(frame)} 字节): {format_frame_hex(frame)}")
-            print(f"     SYNC=AA TYPE={frame_type:02X} LEN={len(json_str):04X}")
-
-        # 等待可能的回复
-        print(f"  等待回复 ...")
-        try:
-            response = sock.recv(4096)
-            if response:
-                print(f"  <- 收到回复 ({len(response)} 字节):")
-                # 尝试解析回复内容
-                text = response.decode("utf-8", errors="replace")
-                for line in text.split("\n"):
-                    line = line.strip()
-                    if line:
-                        print(f"     JSON: {line}")
-
-                # 尝试按协议帧解析
-                print(f"     十六进制: {format_frame_hex(response)}")
-                result = unpack_frame(response)
-                if result:
-                    print(f"     帧解析: type=0x{result['type']:02X}({result['type_name']}) "
-                          f"len={result['len']} json={result['json']}")
-            else:
-                print(f"  <- 无回复 (服务器关闭连接)")
-        except socket.timeout:
-            print(f"  <- 无回复 (超时 {timeout}s)")
-
-        sock.close()
-        return True
-
-    except socket.timeout:
-        print(f"  ✗ 连接超时 ({timeout}s)")
-        return False
-    except ConnectionRefusedError:
-        print(f"  ✗ 连接被拒绝 (服务器未启动或端口不对)")
-        return False
-    except Exception as e:
-        print(f"  ✗ 错误: {e}")
-        return False
+def format_hex(data: bytes) -> str:
+    return " ".join(f"{b:02X}" for b in data)
 
 
 def detect_type(json_str: str) -> int:
-    """根据 JSON 的 t 字段推断协议帧 type"""
     if '"set_panel"' in json_str:
-        return TYPE_SET_PANEL
+        return 0x20
     if '"selftest"' in json_str:
-        return TYPE_SELFTEST
+        return 0x21
     if '"task"' in json_str:
-        return TYPE_TASK_SWITCH
+        return 0x22
     if '"cmd"' in json_str:
-        return TYPE_CMD_INDEX
+        return 0x23
     if '"shutdown"' in json_str:
-        return TYPE_SHUTDOWN
+        return 0x24
     return 0
 
 
-def show_help():
-    """显示帮助"""
-    print("""
-===== ESP-12F 测试客户端 =====
-
-交互命令:
-  panel <id> <mode>   设置面板模式 (id=1~4, mode=1除尘/2复位)
-  selftest            系统自检
-  task <id>           切换任务 (1~7)
-  cmd <idx>           命令索引 (1~8)
-  shutdown            系统关停
-  raw <json>          发送原始 JSON
-  frame <type> <json> 发送原始协议帧 (type 为十六进制如 20)
-  frameraw <hex>      发送原始十六进制数据
-
-  connect <host> <port>  设置连接地址
-  quit / exit / q     退出
-
-预设命令快捷输入:
-  p1c -> 面板1除尘    p1r -> 面板1复位
-  p2c -> 面板2除尘    p2r -> 面板2复位
-  p3c -> 面板3除尘    p3r -> 面板3复位
-  p4c -> 面板4除尘    p4r -> 面板4复位
-  st  -> 自检         sd  -> 关停
-
-当前连接: {host}:{port}
-""".format(host=current_host, port=current_port))
+def get_local_ip():
+    """获取本机局域网 IP"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "?.?.?.?"
 
 
-def interactive():
-    """交互模式"""
-    global current_host, current_port
+# ===================================================================
+#  TCP 服务端 — 等待 ESP-12F 连接，然后交互
+# ===================================================================
+class BridgeServer:
+    def __init__(self, bind_addr: str, port: int):
+        self.bind_addr = bind_addr
+        self.port = port
+        self.sock = None
+        self.client = None
+        self.client_addr = None
+        self.running = False
+        self.send_queue = []  # 待发送命令队列
 
-    show_help()
+    def start(self):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind((self.bind_addr, self.port))
+        self.sock.listen(1)
+        self.sock.settimeout(1.0)  # 允许主循环中断
+        self.running = True
 
-    while True:
+        local_ip = get_local_ip()
+        print(f"  TCP 服务端已启动")
+        print(f"  监听地址: {local_ip}:{self.port}")
+        print(f"  等待 ESP-12F 连接 ...")
+        print(f"  (ESP-12F config.h 中 SERVER_IP 应设为 {local_ip})")
+        print()
+
+    def stop(self):
+        self.running = False
+        if self.client:
+            try:
+                self.client.close()
+            except Exception:
+                pass
+            self.client = None
+        if self.sock:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+            self.sock = None
+
+    def accept(self):
+        """尝试接受一个客户端连接"""
         try:
-            line = input("TEST> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\n  退出")
-            break
+            client, addr = self.sock.accept()
+            self.client = client
+            self.client_addr = addr
+            client.settimeout(0.1)  # 非阻塞读取
+            print(f">>> ESP-12F 已连接: {addr[0]}:{addr[1]}")
+            # 发送队列中的待发送命令
+            for json_str in self.send_queue:
+                self._send_json(json_str)
+            self.send_queue.clear()
+            return True
+        except socket.timeout:
+            return False
 
-        if not line:
-            continue
+    def _send_json(self, json_str: str):
+        data = (json_str + "\n").encode("utf-8")
+        try:
+            self.client.sendall(data)
+            ft = detect_type(json_str)
+            type_name = TYPE_NAMES.get(ft, "?")
+            frame = pack_frame(ft, json_str) if ft else b""
+            print(f"  -> JSON ({len(data)-1}B): {json_str}")
+            if frame:
+                print(f"     UART帧 ({len(frame)}B): {format_hex(frame)}  type=0x{ft:02X}({type_name})")
+        except Exception as e:
+            print(f"  !! 发送失败: {e}")
 
-        parts = line.split()
-        cmd = parts[0].lower()
+    def send(self, json_str: str):
+        if self.client:
+            self._send_json(json_str)
+        else:
+            self.send_queue.append(json_str)
+            print(f"  (ESP-12F 未连接，命令已缓存，连接后自动发送)")
 
-        # ---- 退出 ----
-        if cmd in ("quit", "exit", "q"):
-            break
+    def recv(self):
+        """读取客户端发来的数据并打印"""
+        if not self.client:
+            return False
+        try:
+            data = self.client.recv(4096)
+            if not data:
+                print(f"<<< ESP-12F 已断开: {self.client_addr}")
+                try:
+                    self.client.close()
+                except Exception:
+                    pass
+                self.client = None
+                self.client_addr = None
+                print(f"  等待 ESP-12F 重新连接 ...")
+                return False
+            # 解析并打印收到的数据
+            for line in data.decode("utf-8", errors="replace").split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                # 心跳不重复打印
+                if line == '{"t":"hb"}':
+                    print(f"  <- 心跳", end="\r")
+                    continue
+                print(f"  <- JSON: {line}")
+                # 展开面板状态
+                if '"t":"panels"' in line:
+                    try:
+                        import json
+                        obj = json.loads(line)
+                        for p in obj.get("p", []):
+                            st_text = {0: "空闲", 1: "除尘中", 2: "复位中"}.get(p.get("st"), "?")
+                            print(f"       面板{p['id']}: {st_text}  ts={p.get('ts', '?')}")
+                    except Exception:
+                        pass
+            return True
+        except socket.timeout:
+            return True  # 正常超时
+        except Exception as e:
+            print(f"  !! 读取错误: {e}")
+            return False
 
-        # ---- 帮助 ----
-        if cmd in ("help", "h", "?"):
-            show_help()
-            continue
 
-        # ---- 切换连接地址 ----
-        if cmd == "connect":
-            if len(parts) >= 3:
-                current_host = parts[1]
-                current_port = int(parts[2])
-                print(f"  已设置: {current_host}:{current_port}")
-            else:
-                print(f"  用法: connect <ip> <port>")
-            continue
+# ===================================================================
+#  交互模式
+# ===================================================================
+def run_interactive(server: BridgeServer):
+    print("  输入命令发送给 ESP-12F -> MCU，或输入 help 查看帮助")
+    print("  (ESP-12F 发来的数据会自动显示)")
+    print()
 
-        # ---- 预设快捷命令 ----
-        if cmd in PRESETS:
-            json_str = PRESETS[cmd]
-            send_tcp(current_host, current_port, json_str)
-            continue
+    while server.running:
+        # ---- 接受连接 ----
+        if not server.client:
+            server.accept()
 
-        # ---- 面板命令 ----
-        if cmd == "panel":
-            if len(parts) < 3:
-                print("  用法: panel <id 1~4> <mode 1除尘/2复位>")
-                continue
-            panel_id = parts[1]
-            mode = parts[2]
-            json_str = '{"t":"set_panel","id":' + panel_id + ',"mode":' + mode + '}'
-            send_tcp(current_host, current_port, json_str)
-            continue
+        # ---- 读取数据 ----
+        server.recv()
 
-        # ---- 自检 ----
-        if cmd == "selftest":
-            send_tcp(current_host, current_port, PRESETS["selftest"])
-            continue
+        # ---- 用户输入 (非阻塞) ----
+        if sys.platform == "win32":
+            import msvcrt
+            if msvcrt.kbhit():
+                line = input()
+                handle_input(server, line)
+        else:
+            r, _, _ = select.select([sys.stdin], [], [], 0.5)
+            if r:
+                line = sys.stdin.readline()
+                if line:
+                    handle_input(server, line.strip())
+                else:
+                    break  # EOF
 
-        # ---- 任务切换 ----
-        if cmd == "task":
-            if len(parts) < 2:
-                print("  用法: task <id 1~7>")
-                continue
-            json_str = '{"t":"task","id":' + parts[1] + '}'
-            send_tcp(current_host, current_port, json_str)
-            continue
+        # 小延迟防止 CPU 空转
+        # (socket timeout already provides the delay)
 
-        # ---- 命令索引 ----
-        if cmd == "cmd":
-            if len(parts) < 2:
-                print("  用法: cmd <idx 1~8>")
-                continue
-            json_str = '{"t":"cmd","idx":' + parts[1] + '}'
-            send_tcp(current_host, current_port, json_str)
-            continue
 
-        # ---- 关停 ----
-        if cmd == "shutdown":
-            send_tcp(current_host, current_port, PRESETS["shutdown"])
-            continue
+def handle_input(server: BridgeServer, line: str):
+    if not line:
+        return
 
-        # ---- 原始 JSON ----
-        if cmd == "raw":
-            json_str = line[4:]  # 取 "raw " 之后的内容
-            if json_str:
-                send_tcp(current_host, current_port, json_str)
-            else:
-                print("  用法: raw <json字符串>")
-            continue
+    parts = line.split()
+    cmd = parts[0].lower()
 
-        # ---- 原始协议帧 ----
-        if cmd == "frame":
-            if len(parts) < 3:
-                print("  用法: frame <type_hex> <json>")
-                print("  例如: frame 20 {\"t\":\"set_panel\",\"id\":1,\"mode\":1}")
-                continue
-            try:
-                frame_type = int(parts[1], 16)
-            except ValueError:
-                print(f"  type 必须是十六进制数，如 20")
-                continue
-            json_str = " ".join(parts[2:])
-            if not json_str:
-                print("  payload 不能为空")
-                continue
-            frame = pack_frame(frame_type, json_str)
-            print(f"\n  协议帧 ({len(frame)} 字节): {format_frame_hex(frame)}")
-            print(f"  SYNC=AA TYPE={frame_type:02X}({TYPE_NAMES.get(frame_type, 'UNKNOWN')}) "
-                  f"LEN={len(json_str):04X} CHECKSUM={frame[-1]:02X}")
-            # 也可以通过 TCP 发送原始帧
-            print(f"  注意: 在 TCP 模式下通常发送 JSON 而非协议帧，协议帧用于 UART。")
-            print(f"  如需发送原始 TCP 数据，请用 frameraw 命令。")
-            continue
+    # ---- 退出 ----
+    if cmd in ("quit", "exit", "q"):
+        server.stop()
+        print("  退出")
+        return
 
-        # ---- 发送原始十六进制数据 ----
-        if cmd == "frameraw":
-            hex_str = line[8:].replace(" ", "")
-            if not hex_str:
-                print("  用法: frameraw <hex字符串>")
-                print("  例如: frameraw AA20001D7B22743A227365745..."
-                "F70616E656C222C226964223A312C226D6F6465223A317DXX")
-                continue
-            try:
-                raw = bytes.fromhex(hex_str)
-            except ValueError as e:
-                print(f"  十六进制解析错误: {e}")
-                continue
-            print(f"\n  连接 {current_host}:{current_port} ...")
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(5)
-            try:
-                sock.connect((current_host, current_port))
-                sock.sendall(raw)
-                print(f"  -> 已发送 {len(raw)} 字节: {format_frame_hex(raw)}")
-                # 解析帧
-                result = unpack_frame(raw)
-                if result:
-                    if result["valid"]:
-                        print(f"     帧解析: type=0x{result['type']:02X}({result['type_name']}) "
-                              f"len={result['len']} json={result['json']}")
-                    else:
-                        print(f"     帧校验失败: calc=0x{result['calc']:02X} recv=0x{result['recv']:02X}")
-                sock.close()
-            except Exception as e:
-                print(f"  ✗ 错误: {e}")
-            continue
+    # ---- 帮助 ----
+    if cmd in ("help", "h", "?"):
+        print("""
+  交互命令 (发送给 ESP-12F -> MCU):
+    panel <id> <mode>   设置面板模式 (id=1~4, mode=1除尘/2复位)
+    selftest            系统自检
+    task <id>           切换任务 (1~7)
+    cmd <idx>           命令索引 (1~8)
+    shutdown            系统关停
+    raw <json>          发送原始 JSON
 
-        # ---- 未知命令 ----
-        print(f"  未知命令: {cmd} (输入 help 查看帮助)")
-        # 尝试模糊匹配快捷命令
-        suggestions = [k for k in PRESETS if k.startswith(cmd)]
-        if suggestions:
-            print(f"  你是不是想输入: {', '.join(suggestions)}")
+  快捷命令:
+    p1c -> 面板1除尘    p1r -> 面板1复位
+    p2c -> 面板2除尘    p2r -> 面板2复位
+    p3c -> 面板3除尘    p3r -> 面板3复位
+    p4c -> 面板4除尘    p4r -> 面板4复位
+    st  -> 自检         sd  -> 关停
+
+    quit / exit / q     退出
+    status              查看连接状态
+""")
+        return
+
+    # ---- 查看状态 ----
+    if cmd == "status":
+        if server.client:
+            print(f"  已连接: {server.client_addr}")
+        else:
+            print(f"  未连接，等待 ESP-12F ...")
+        print(f"  监听端口: {server.port}")
+        return
+
+    # ---- 预设快捷命令 ----
+    if cmd in PRESETS:
+        server.send(PRESETS[cmd])
+        return
+
+    # ---- 面板 ----
+    if cmd == "panel":
+        if len(parts) < 3:
+            print("  用法: panel <id 1~4> <mode 1除尘/2复位>")
+            return
+        json_str = '{"t":"set_panel","id":' + parts[1] + ',"mode":' + parts[2] + '}'
+        server.send(json_str)
+        return
+
+    # ---- 自检 ----
+    if cmd == "selftest":
+        server.send(PRESETS["selftest"])
+        return
+
+    # ---- 任务 ----
+    if cmd == "task":
+        if len(parts) < 2:
+            print("  用法: task <id 1~7>")
+            return
+        server.send('{"t":"task","id":' + parts[1] + '}')
+        return
+
+    # ---- 命令索引 ----
+    if cmd == "cmd":
+        if len(parts) < 2:
+            print("  用法: cmd <idx 1~8>")
+            return
+        server.send('{"t":"cmd","idx":' + parts[1] + '}')
+        return
+
+    # ---- 关停 ----
+    if cmd == "shutdown":
+        server.send(PRESETS["shutdown"])
+        return
+
+    # ---- 原始 JSON ----
+    if cmd == "raw":
+        json_str = line[4:]
+        if json_str:
+            server.send(json_str)
+        else:
+            print("  用法: raw <json字符串>")
+        return
+
+    # ---- 显示帧格式 ----
+    if cmd == "frame":
+        if len(parts) < 3:
+            print("  用法: frame <type_hex> <json>")
+            print("  例如: frame 20 {\\\"t\\\":\\\"set_panel\\\",\\\"id\\\":1,\\\"mode\\\":1}")
+            return
+        try:
+            ft = int(parts[1], 16)
+        except ValueError:
+            print("  type 必须是十六进制数，如 20")
+            return
+        json_str = " ".join(parts[2:])
+        frame = pack_frame(ft, json_str)
+        print(f"  协议帧 ({len(frame)}B): {format_hex(frame)}")
+        print(f"  SYNC=AA TYPE={ft:02X}({TYPE_NAMES.get(ft, '?')}) "
+              f"LEN={len(json_str):04X} CHECKSUM={frame[-1]:02X}")
+        return
+
+    # ---- 未知命令 ----
+    print(f"  未知命令: {cmd} (输入 help 查看帮助)")
+    suggestions = [k for k in PRESETS if k.startswith(cmd)]
+    if suggestions:
+        print(f"  你是不是想输入: {', '.join(suggestions)}")
+
+
+# ===================================================================
+#  非交互模式: 发送单条命令
+# ===================================================================
+def run_one_shot(server: BridgeServer, json_str: str):
+    import time
+    # 等 ESP-12F 连接
+    print("  等待 ESP-12F 连接 ...")
+    wait_start = time.time()
+    while not server.client and (time.time() - wait_start) < 30:
+        server.accept()
+        time.sleep(0.1)
+    if not server.client:
+        print("  !! 超时: ESP-12F 未在 30s 内连接")
+        return
+
+    server.send(json_str)
+    # 再等一会儿看回复
+    deadline = time.time() + 3
+    while time.time() < deadline:
+        server.recv()
+        time.sleep(0.1)
+
+    server.stop()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="ESP-12F WiFi 桥接测试客户端",
+        description="ESP-12F WiFi 桥接测试服务端 (TCP Server)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  py tools/test_client.py                        交互模式
-  py tools/test_client.py --panel 1 1            面板1除尘
-  py tools/test_client.py --panel 2 2            面板2复位
-  py tools/test_client.py --selftest             系统自检
-  py tools/test_client.py --task 3               切换任务3
-  py tools/test_client.py --cmd 5                命令索引5
-  py tools/test_client.py --shutdown             系统关停
-  py tools/test_client.py --raw '{"t":"hb"}'     发送自定义JSON
-  py tools/test_client.py --frame 20 '{"t":"set_panel","id":1,"mode":1}'  显示帧格式
+  py tools/test_client.py                        启动服务端，交互模式
+  py tools/test_client.py --port 8888            指定端口
+  py tools/test_client.py --panel 1 1            等待连接后自动发送面板1除尘
+  py tools/test_client.py --selftest             等待连接后自动发送自检
+
+ESP-12F 的 config.h 应配置:
+  #define SERVER_IP   "本机局域网IP"    // 脚本启动时会显示
+  #define SERVER_PORT 8888
         """,
     )
-    parser.add_argument("--host", default=DEFAULT_HOST, help=f"ESP-12F IP 地址 (默认: {DEFAULT_HOST})")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"TCP 端口 (默认: {DEFAULT_PORT})")
+    parser.add_argument("--bind", default=DEFAULT_BIND, help=f"监听地址 (默认: {DEFAULT_BIND}=所有网卡)")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"监听端口 (默认: {DEFAULT_PORT})")
     parser.add_argument("--panel", nargs=2, metavar=("ID", "MODE"), help="面板命令: ID(1~4) MODE(1除尘/2复位)")
     parser.add_argument("--selftest", action="store_true", help="发送自检命令")
     parser.add_argument("--task", type=int, metavar="ID", help="切换任务: ID(1~7)")
     parser.add_argument("--cmd", type=int, metavar="IDX", help="命令索引: IDX(1~8)")
     parser.add_argument("--shutdown", action="store_true", help="发送关停命令")
     parser.add_argument("--raw", type=str, metavar="JSON", help="发送原始 JSON 字符串")
-    parser.add_argument("--frame", nargs=2, metavar=("TYPE_HEX", "JSON"), help="仅显示协议帧格式 (不发送)")
+    parser.add_argument("--frame", nargs=2, metavar=("TYPE_HEX", "JSON"), help="仅显示协议帧格式 (不启动服务)")
 
     args = parser.parse_args()
 
-    current_host = args.host
-    current_port = args.port
-
-    # ---- 非交互模式: 发送单条命令后退出 ----
-    if args.panel:
-        panel_id, mode = args.panel
-        json_str = '{"t":"set_panel","id":' + panel_id + ',"mode":' + mode + '}'
-        send_tcp(current_host, current_port, json_str)
-    elif args.selftest:
-        send_tcp(current_host, current_port, PRESETS["selftest"])
-    elif args.task:
-        json_str = '{"t":"task","id":' + str(args.task) + '}'
-        send_tcp(current_host, current_port, json_str)
-    elif args.cmd:
-        json_str = '{"t":"cmd","idx":' + str(args.cmd) + '}'
-        send_tcp(current_host, current_port, json_str)
-    elif args.shutdown:
-        send_tcp(current_host, current_port, PRESETS["shutdown"])
-    elif args.raw:
-        send_tcp(current_host, current_port, args.raw)
-    elif args.frame:
+    # ---- --frame 只看帧格式,不启动服务 ----
+    if args.frame:
         try:
-            frame_type = int(args.frame[0], 16)
+            ft = int(args.frame[0], 16)
         except ValueError:
-            print(f"错误: type 必须是十六进制数")
+            print("错误: type 必须是十六进制数")
             sys.exit(1)
         json_str = args.frame[1]
-        frame = pack_frame(frame_type, json_str)
-        print(f"协议帧 ({len(frame)} 字节): {format_frame_hex(frame)}")
-        print(f"  SYNC=AA TYPE={frame_type:02X}({TYPE_NAMES.get(frame_type, 'UNKNOWN')}) "
+        frame = pack_frame(ft, json_str)
+        print(f"协议帧 ({len(frame)}B): {format_hex(frame)}")
+        print(f"  SYNC=AA TYPE={ft:02X}({TYPE_NAMES.get(ft, '?')}) "
               f"LEN={len(json_str):04X} CHECKSUM={frame[-1]:02X}")
-    else:
-        # 交互模式
-        interactive()
+        sys.exit(0)
+
+    # ---- 构建要发送的命令 ----
+    one_shot_json = None
+    if args.panel:
+        panel_id, mode = args.panel
+        one_shot_json = '{"t":"set_panel","id":' + panel_id + ',"mode":' + mode + '}'
+    elif args.selftest:
+        one_shot_json = PRESETS["selftest"]
+    elif args.task:
+        one_shot_json = '{"t":"task","id":' + str(args.task) + '}'
+    elif args.cmd:
+        one_shot_json = '{"t":"cmd","idx":' + str(args.cmd) + '}'
+    elif args.shutdown:
+        one_shot_json = PRESETS["shutdown"]
+    elif args.raw:
+        one_shot_json = args.raw
+
+    # ---- 启动服务 ----
+    server = BridgeServer(args.bind, args.port)
+    server.start()
+
+    try:
+        if one_shot_json:
+            # 非交互模式
+            server.send_queue.append(one_shot_json)
+            run_one_shot(server, one_shot_json)
+        else:
+            # 交互模式
+            run_interactive(server)
+    except KeyboardInterrupt:
+        print("\n  退出")
+    finally:
+        server.stop()

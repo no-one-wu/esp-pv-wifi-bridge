@@ -2,12 +2,12 @@
 #define CONFIG_H
 
 // ============ WiFi 配置 ============
-#define WIFI_SSID   "YOUR_WIFI_SSID"
-#define WIFI_PASS   "YOUR_WIFI_PASSWORD"
+#define WIFI_SSID   "1"//iQOO Neo9 Pro
+#define WIFI_PASS   "12345678"//wucaijin1
 
 // ============ TCP 服务器配置 ============
 // 前端服务器地址 (支持 IP 或域名), 设为 255.255.255.255 则使用 UDP 广播
-#define SERVER_IP   "192.168.1.100"
+#define SERVER_IP   "192.168.0.200"
 #define SERVER_PORT 8888
 
 // 通信模式: 注释掉使用 TCP 客户端, 取消注释使用 UDP 广播
@@ -25,7 +25,7 @@
 #define HEARTBEAT_INTERVAL   30000  // 心跳间隔 ms
 
 // ============ 调试开关 ============
-// #define DEBUG_ENABLE
+#define DEBUG_ENABLE
 
 #ifdef DEBUG_ENABLE
   #define DEBUG(fmt, ...) Serial.printf("[DBG] " fmt "\r\n", ##__VA_ARGS__)

@@ -9,6 +9,7 @@ CMDS = [
     '{"t":"set_panel","id":1,"mode":1}',   # 面板1除尘
     '{"t":"set_panel","id":2,"mode":2}',   # 面板2复位
     '{"t":"selftest"}',                     # 自检
+    '{"t":"alarm"}',                        # 报警灯 (PA.0 高电平2秒)
     '{"t":"task","id":1}',                  # 任务1
 ]
 
